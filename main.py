@@ -20,7 +20,7 @@ class LVMStateChecker:
                 check=False
             )
             return result.stdout.strip(), result.returncode
-        except Exception as e:
+        except Exception:
             return "", 1
     
     def display_table(self, title, headers, data, table_format="simple"):
@@ -33,15 +33,16 @@ class LVMStateChecker:
             print("No data available")
     
     def check_lvm_installation(self):
-        output, code = self.run_command("lvm version 2>/dev/null | head -1")
+        output, code = self.run_command("which lvm 2>/dev/null")
         if code == 0 and output:
-            print(f"LVM Version: {output}")
-            self.lvm_info['version'] = output
-            return True
-        else:
-            print("LVM is not installed or not in PATH")
-            self.lvm_info['lvm_installed'] = False
-            return False
+            version_output, _ = self.run_command("lvm version 2>/dev/null | head -1")
+            if version_output:
+                print(f"LVM Version: {version_output}")
+                self.lvm_info['version'] = version_output
+                return True
+        print("LVM is not installed or not in PATH")
+        self.lvm_info['lvm_installed'] = False
+        return False
     
     def check_physical_volumes(self):
         output, code = self.run_command("pvs --units g --nosuffix --noheadings -o pv_name,pv_size,pv_free,pv_used,vg_name,pv_attr 2>/dev/null")
@@ -50,15 +51,18 @@ class LVMStateChecker:
             if line.strip():
                 parts = line.strip().split()
                 if len(parts) >= 6:
-                    size = float(parts[1]) if parts[1] else 0
-                    free = float(parts[2]) if parts[2] else 0
-                    used = float(parts[3]) if parts[3] else 0
-                    used_percent = (used/size)*100 if size > 0 else 0
-                    status = "ACTIVE" if "a" in parts[5] else "INACTIVE"
-                    pvs_data.append([
-                        parts[0], parts[4], f"{size:.2f} GB", 
-                        f"{free:.2f} GB", f"{used_percent:.1f}%", status
-                    ])
+                    try:
+                        size = float(parts[1]) if parts[1] else 0.0
+                        free = float(parts[2]) if parts[2] else 0.0
+                        used = float(parts[3]) if parts[3] else 0.0
+                        used_percent = (used/size)*100 if size > 0 else 0.0
+                        status = "ACTIVE" if "a" in parts[5] else "INACTIVE"
+                        pvs_data.append([
+                            parts[0], parts[4], f"{size:.2f} GB", 
+                            f"{free:.2f} GB", f"{used_percent:.1f}%", status
+                        ])
+                    except ValueError:
+                        continue
         self.display_table(
             "PHYSICAL VOLUMES (PVS)",
             ["PV Name", "VG Name", "Size", "Free", "Used %", "Status"],
@@ -73,14 +77,17 @@ class LVMStateChecker:
             if line.strip():
                 parts = line.strip().split()
                 if len(parts) >= 6:
-                    size = float(parts[1]) if parts[1] else 0
-                    free = float(parts[2]) if parts[2] else 0
-                    free_percent = (free/size)*100 if size > 0 else 0
-                    status = "ACTIVE" if "a" in parts[3] else "INACTIVE"
-                    vgs_data.append([
-                        parts[0], f"{size:.2f} GB", f"{free:.2f} GB",
-                        f"{free_percent:.1f}%", parts[4], parts[5], status
-                    ])
+                    try:
+                        size = float(parts[1]) if parts[1] else 0.0
+                        free = float(parts[2]) if parts[2] else 0.0
+                        free_percent = (free/size)*100 if size > 0 else 0.0
+                        status = "ACTIVE" if "a" in parts[3] else "INACTIVE"
+                        vgs_data.append([
+                            parts[0], f"{size:.2f} GB", f"{free:.2f} GB",
+                            f"{free_percent:.1f}%", parts[4], parts[5], status
+                        ])
+                    except ValueError:
+                        continue
         self.display_table(
             "VOLUME GROUPS (VGS)",
             ["VG Name", "Size", "Free", "Free %", "PV Count", "LV Count", "Status"],
@@ -95,14 +102,18 @@ class LVMStateChecker:
             if line.strip():
                 parts = line.strip().split()
                 if len(parts) >= 4:
-                    lv_type = "THIN" if "t" in parts[3] else "SNAP" if "s" in parts[3] else "NORMAL"
-                    status = "ACTIVE" if "a" in parts[3] else "INACTIVE"
-                    pool = parts[4] if len(parts) > 4 and parts[4] else "N/A"
-                    origin = parts[5] if len(parts) > 5 and parts[5] else "N/A"
-                    lvs_data.append([
-                        parts[1], parts[0], f"{float(parts[2]):.2f} GB",
-                        lv_type, pool, origin, status
-                    ])
+                    try:
+                        size = float(parts[2]) if parts[2] else 0.0
+                        lv_type = "THIN" if "t" in parts[3] else "SNAP" if "s" in parts[3] else "NORMAL"
+                        status = "ACTIVE" if "a" in parts[3] else "INACTIVE"
+                        pool = parts[4] if len(parts) > 4 and parts[4] != "" else "N/A"
+                        origin = parts[5] if len(parts) > 5 and parts[5] != "" else "N/A"
+                        lvs_data.append([
+                            parts[1], parts[0], f"{size:.2f} GB",
+                            lv_type, pool, origin, status
+                        ])
+                    except ValueError:
+                        continue
         self.display_table(
             "LOGICAL VOLUMES (LVS)",
             ["VG Name", "LV Name", "Size", "Type", "Pool", "Origin", "Status"],
@@ -111,18 +122,21 @@ class LVMStateChecker:
         self.lvm_info['lvs'] = lvs_data
     
     def check_thin_pools(self):
-        output, code = self.run_command("lvs --units g --nosuffix --noheadings -o lv_name,vg_name,data_percent,metadata_percent,thin_count 2>/dev/null | grep thin-pool")
+        output, code = self.run_command("lvs --units g --nosuffix --noheadings -o lv_name,vg_name,data_percent,metadata_percent,thin_count 2>/dev/null")
         thin_data = []
         for line in output.strip().split('\n'):
             if line.strip():
                 parts = line.strip().split()
-                if len(parts) >= 5:
-                    data_pct = float(parts[2]) if parts[2] else 0
-                    meta_pct = float(parts[3]) if parts[3] else 0
-                    thin_data.append([
-                        parts[1], parts[0], f"{data_pct:.1f}%",
-                        f"{meta_pct:.1f}%", parts[4]
-                    ])
+                if len(parts) >= 5 and "thin-pool" in line:
+                    try:
+                        data_pct = float(parts[2]) if parts[2] != "" else 0.0
+                        meta_pct = float(parts[3]) if parts[3] != "" else 0.0
+                        thin_data.append([
+                            parts[1], parts[0], f"{data_pct:.1f}%",
+                            f"{meta_pct:.1f}%", parts[4]
+                        ])
+                    except ValueError:
+                        continue
         self.display_table(
             "THIN POOLS",
             ["VG Name", "Pool Name", "Data Used %", "Meta Used %", "Thin Volumes"],
@@ -131,16 +145,17 @@ class LVMStateChecker:
         self.lvm_info['thin_pools'] = thin_data
     
     def check_lvm_mounts(self):
-        output, code = self.run_command("mount | grep /dev/mapper")
+        output, code = self.run_command("mount")
         mounts_data = []
         for line in output.strip().split('\n'):
             if line:
                 parts = line.split()
-                if len(parts) >= 3:
+                if len(parts) >= 6:
                     device = parts[0]
-                    mount_point = parts[2]
-                    fs_type = parts[4] if len(parts) > 4 else "unknown"
-                    mounts_data.append([device, mount_point, fs_type])
+                    if '/dev/mapper/' in device or '/dev/dm-' in device:
+                        mount_point = parts[2]
+                        fs_type = parts[4]
+                        mounts_data.append([device, mount_point, fs_type])
         self.display_table(
             "MOUNTED LVM VOLUMES",
             ["Device", "Mount Point", "Filesystem Type"],
@@ -149,7 +164,7 @@ class LVMStateChecker:
         self.lvm_info['mounts'] = mounts_data
     
     def check_dm_devices(self):
-        output, code = self.run_command("dmsetup status --target linear")
+        output, code = self.run_command("dmsetup status")
         dm_data = []
         if code == 0 and output:
             for line in output.strip().split('\n'):
@@ -255,11 +270,13 @@ def main():
     if args.json:
         checker.export_json(args.output)
     
-    issues = (
-        (summary.get('physical_volumes', 0) > 0 and any("INACTIVE" in str(row) for row in lvm_info.get('pvs', []))) or
-        (summary.get('volume_groups', 0) > 0 and any("INACTIVE" in str(row) for row in lvm_info.get('vgs', []))) or
-        (summary.get('logical_volumes', 0) > 0 and any("INACTIVE" in str(row) for row in lvm_info.get('lvs', [])))
-    )
+    issues = False
+    if isinstance(lvm_info.get('pvs'), list):
+        issues = issues or any("INACTIVE" in str(row) for row in lvm_info.get('pvs', []))
+    if isinstance(lvm_info.get('vgs'), list):
+        issues = issues or any("INACTIVE" in str(row) for row in lvm_info.get('vgs', []))
+    if isinstance(lvm_info.get('lvs'), list):
+        issues = issues or any("INACTIVE" in str(row) for row in lvm_info.get('lvs', []))
     
     sys.exit(1 if issues else 0)
 
