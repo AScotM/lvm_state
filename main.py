@@ -14,6 +14,7 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 from collections import defaultdict
 import math
+import signal
 
 try:
     from tabulate import tabulate
@@ -54,6 +55,8 @@ class PhysicalVolume:
     attributes: str
     dev_size: Optional[str] = None
     uuid: Optional[str] = None
+    disk_errors: Optional[int] = None
+    disk_model: Optional[str] = None
     
     @property
     def lvm_status(self) -> LVMStatus:
@@ -61,6 +64,8 @@ class PhysicalVolume:
             return LVMStatus.CRITICAL
         if "inactive" in self.status.lower():
             return LVMStatus.WARNING
+        if self.disk_errors and self.disk_errors > 0:
+            return LVMStatus.CRITICAL
         return LVMStatus.HEALTHY
 
 
@@ -73,6 +78,8 @@ class VolumeGroup:
     pv_count: int
     lv_count: int
     attributes: str
+    lock_type: Optional[str] = None
+    lock_args: Optional[str] = None
     uuid: Optional[str] = None
     extent_size: Optional[str] = None
     
@@ -82,6 +89,12 @@ class VolumeGroup:
             return LVMStatus.CRITICAL
         if "x" in self.attributes:
             return LVMStatus.CRITICAL
+        if self.lock_type and self.lock_type not in ["normal", "None", ""]:
+            return LVMStatus.WARNING
+        if self.free_percent < 5:
+            return LVMStatus.CRITICAL
+        if self.free_percent < 10:
+            return LVMStatus.WARNING
         if "p" not in self.attributes and "x" not in self.attributes:
             return LVMStatus.HEALTHY
         return LVMStatus.WARNING
@@ -97,6 +110,9 @@ class LogicalVolume:
     origin: Optional[str]
     status: str
     attributes: str
+    raid_sync_percent: Optional[float] = None
+    cache_total_blocks: Optional[int] = None
+    cache_used_blocks: Optional[int] = None
     uuid: Optional[str] = None
     segments: Optional[str] = None
     
@@ -111,9 +127,18 @@ class LogicalVolume:
             return LVMStatus.CRITICAL
         if "m" in self.attributes:
             return LVMStatus.WARNING
+        if "r" in self.attributes and self.raid_sync_percent is not None:
+            if self.raid_sync_percent < 100:
+                return LVMStatus.WARNING
+        if "C" in self.attributes and self.cache_used_blocks is not None and self.cache_total_blocks is not None:
+            cache_usage = (self.cache_used_blocks / self.cache_total_blocks * 100) if self.cache_total_blocks > 0 else 0
+            if cache_usage > 90:
+                return LVMStatus.WARNING
         return LVMStatus.HEALTHY
     
     def _check_snapshot_status(self) -> LVMStatus:
+        if "O" in self.attributes:
+            return LVMStatus.WARNING
         return LVMStatus.HEALTHY
 
 
@@ -125,18 +150,51 @@ class ThinPool:
     metadata_percent: float
     thin_count: int
     lv_uuid: Optional[str] = None
+    metadata_size_gb: Optional[float] = None
+    data_size_gb: Optional[float] = None
     
     @property
     def lvm_status(self) -> LVMStatus:
-        if self.data_percent > 90:
+        if self.data_percent > 95:
             return LVMStatus.CRITICAL
-        if self.data_percent > 80:
+        if self.data_percent > 85:
             return LVMStatus.WARNING
-        if self.metadata_percent > 90:
+        if self.metadata_percent > 95:
             return LVMStatus.CRITICAL
-        if self.metadata_percent > 80:
+        if self.metadata_percent > 85:
             return LVMStatus.WARNING
         return LVMStatus.HEALTHY
+
+
+@dataclass
+class CachePool:
+    name: str
+    vg_name: str
+    cache_total_blocks: int
+    cache_used_blocks: int
+    cache_dirty_blocks: Optional[int] = None
+    lv_uuid: Optional[str] = None
+    
+    @property
+    def lvm_status(self) -> LVMStatus:
+        if self.cache_total_blocks == 0:
+            return LVMStatus.UNKNOWN
+        usage_percent = (self.cache_used_blocks / self.cache_total_blocks) * 100
+        if usage_percent > 95:
+            return LVMStatus.CRITICAL
+        if usage_percent > 85:
+            return LVMStatus.WARNING
+        return LVMStatus.HEALTHY
+
+
+@dataclass
+class DiskInfo:
+    name: str
+    model: Optional[str] = None
+    size_gb: Optional[float] = None
+    read_errors: int = 0
+    write_errors: int = 0
+    smart_status: Optional[str] = None
 
 
 @dataclass
@@ -145,6 +203,8 @@ class LVMHealthCheck:
     vgs: List[VolumeGroup]
     lvs: List[LogicalVolume]
     thin_pools: List[ThinPool]
+    cache_pools: List[CachePool]
+    disks: List[DiskInfo]
     mounts: List[Dict[str, str]]
     dm_devices: List[Dict[str, str]]
     metadata_backup: Dict[str, Any]
@@ -171,6 +231,14 @@ class LVMHealthCheck:
             if pool.lvm_status == LVMStatus.CRITICAL:
                 critical_components.append(f"Pool:{pool.vg_name}/{pool.name}")
         
+        for pool in self.cache_pools:
+            if pool.lvm_status == LVMStatus.CRITICAL:
+                critical_components.append(f"Cache:{pool.vg_name}/{pool.name}")
+        
+        for disk in self.disks:
+            if disk.read_errors > 10 or disk.write_errors > 10:
+                critical_components.append(f"Disk:{disk.name}")
+        
         if critical_components:
             return LVMStatus.CRITICAL
         if self.warnings:
@@ -185,26 +253,93 @@ class LVMStateChecker:
         self.timeout = timeout
         self.health_check = None
         self._is_root = os.geteuid() == 0
+        self._cache = {}
+        self._cache_timestamp = 0
+        self._cache_ttl = 300
         
     def _colorize(self, text: str, color: str) -> str:
         if self.use_color:
             return f"{color}{text}{Color.RESET}"
         return text
     
+    def _sanitize_lvm_name(self, name: str) -> str:
+        if not name:
+            return ""
+        import re
+        name = re.sub(r'[\x00-\x1F\x7F]', '', name)
+        name = name.replace('\n', '').replace('\r', '')
+        return name.strip()
+    
+    def _validate_command(self, cmd_args: List[str]) -> bool:
+        if not cmd_args:
+            return False
+        
+        cmd_path = cmd_args[0]
+        if not os.path.exists(cmd_path) and '/' not in cmd_path:
+            try:
+                subprocess.run(["which", cmd_path], capture_output=True, check=False)
+            except:
+                return False
+        return True
+    
     def _run_command(self, cmd_args: List[str]) -> Tuple[str, int]:
+        if not self._validate_command(cmd_args):
+            return f"Invalid command: {cmd_args[0] if cmd_args else 'None'}", 1
+        
+        cache_key = "|".join(cmd_args)
+        if cache_key in self._cache:
+            cached_time, cached_result = self._cache[cache_key]
+            if time.time() - cached_time < self._cache_ttl:
+                return cached_result
+        
         try:
             result = subprocess.run(
                 cmd_args,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
-                check=False
+                check=False,
+                start_new_session=True
             )
-            return result.stdout.strip(), result.returncode
-        except subprocess.TimeoutExpired:
+            output = result.stdout.strip()
+            self._cache[cache_key] = (time.time(), output)
+            return output, result.returncode
+        except subprocess.TimeoutExpired as e:
+            try:
+                if hasattr(e, 'cmd') and hasattr(e, 'timeout'):
+                    os.killpg(os.getpgid(e.pid), signal.SIGKILL)
+            except:
+                pass
             return f"Command timed out after {self.timeout}s", 124
         except Exception as e:
             return f"Command failed: {e}", 1
+    
+    def _parse_lvm_attributes(self, attr_string: str) -> Dict[str, bool]:
+        attr_map = {
+            'a': 'active',
+            's': 'snapshot',
+            'm': 'mirrored',
+            'M': 'mirror_log',
+            'o': 'origin',
+            'O': 'origin_with_merging_snapshot',
+            'r': 'raid',
+            'R': 'raid_member',
+            'c': 'cache',
+            'C': 'cache_pool',
+            'V': 'virtual',
+            'i': 'mirror_image',
+            'I': 'mirror_image_out_of_sync',
+            'l': 'log_device',
+            'p': 'pvmove',
+            'v': 'virtual_volume',
+            'e': 'exclusive',
+            'd': 'device_mapper_error',
+        }
+        result = {}
+        for i, (char, desc) in enumerate(attr_map.items()):
+            if i < len(attr_string):
+                result[desc] = attr_string[i] == char
+        return result
     
     def _safe_float(self, value: str, default: float = 0.0) -> float:
         try:
@@ -254,6 +389,41 @@ class LVMStateChecker:
                 print(f"{self._colorize('LVM Version:', Color.BOLD)} {lines[0]}")
         return True
     
+    def check_disk_health(self) -> List[DiskInfo]:
+        disks = []
+        
+        try:
+            cmd = ["lsblk", "-d", "-o", "NAME,MODEL,SIZE", "-b", "--json"]
+            output, code = self._run_command(cmd)
+            if code == 0 and output:
+                try:
+                    data = json.loads(output)
+                    for device in data.get('blockdevices', []):
+                        disk = DiskInfo(
+                            name=device.get('name', ''),
+                            model=device.get('model', ''),
+                            size_gb=float(device.get('size', 0)) / (1024**3) if device.get('size') else None
+                        )
+                        disks.append(disk)
+                except json.JSONDecodeError:
+                    pass
+        except:
+            pass
+        
+        for disk in disks:
+            try:
+                stat_path = f"/sys/block/{disk.name}/stat"
+                if os.path.exists(stat_path):
+                    with open(stat_path, 'r') as f:
+                        stats = f.read().split()
+                        if len(stats) >= 5:
+                            disk.read_errors = self._safe_int(stats[3], 0)
+                            disk.write_errors = self._safe_int(stats[7], 0)
+            except:
+                continue
+        
+        return disks
+    
     def check_physical_volumes(self) -> List[PhysicalVolume]:
         cmd = ["pvs", "--units", "g", "--nosuffix", "--noheadings", 
                "--separator", "|", "-o", "pv_name,vg_name,pv_size,pv_free,pv_used,pv_attr,pv_uuid"]
@@ -269,8 +439,8 @@ class LVMStateChecker:
                 fields = line.strip().split('|')
                 if len(fields) >= 6:
                     try:
-                        name = fields[0].strip()
-                        vg_name = fields[1].strip() if fields[1].strip() != "" else "<orphan>"
+                        name = self._sanitize_lvm_name(fields[0].strip())
+                        vg_name = self._sanitize_lvm_name(fields[1].strip()) if fields[1].strip() != "" else "<orphan>"
                         size_gb = self._safe_float(fields[2])
                         free_gb = self._safe_float(fields[3])
                         used_gb = self._safe_float(fields[4])
@@ -287,6 +457,18 @@ class LVMStateChecker:
                         elif "u" in attributes:
                             status = "UNKNOWN"
                         
+                        disk_errors = 0
+                        disk_model = None
+                        base_disk = name.replace('/dev/', '')
+                        if base_disk and os.path.exists(f"/sys/block/{base_disk.split('/')[0]}/stat"):
+                            try:
+                                with open(f"/sys/block/{base_disk.split('/')[0]}/stat", 'r') as f:
+                                    stats = f.read().split()
+                                    if len(stats) >= 5:
+                                        disk_errors = self._safe_int(stats[3], 0) + self._safe_int(stats[7], 0)
+                            except:
+                                pass
+                        
                         pv = PhysicalVolume(
                             name=name,
                             vg_name=vg_name,
@@ -295,7 +477,9 @@ class LVMStateChecker:
                             used_percent=used_percent,
                             status=status,
                             attributes=attributes,
-                            uuid=uuid
+                            uuid=uuid,
+                            disk_errors=disk_errors,
+                            disk_model=disk_model
                         )
                         pvs.append(pv)
                     except Exception as e:
@@ -306,7 +490,7 @@ class LVMStateChecker:
     
     def check_volume_groups(self) -> List[VolumeGroup]:
         cmd = ["vgs", "--units", "g", "--nosuffix", "--noheadings",
-               "--separator", "|", "-o", "vg_name,vg_size,vg_free,vg_attr,pv_count,lv_count,vg_uuid,vg_extent_size"]
+               "--separator", "|", "-o", "vg_name,vg_size,vg_free,vg_attr,pv_count,lv_count,vg_uuid,vg_extent_size,vg_lock_type,vg_lock_args"]
         
         output, code = self._run_command(cmd)
         vgs = []
@@ -319,7 +503,7 @@ class LVMStateChecker:
                 fields = line.strip().split('|')
                 if len(fields) >= 6:
                     try:
-                        name = fields[0].strip()
+                        name = self._sanitize_lvm_name(fields[0].strip())
                         size_gb = self._safe_float(fields[1])
                         free_gb = self._safe_float(fields[2])
                         attributes = fields[3].strip()
@@ -327,6 +511,8 @@ class LVMStateChecker:
                         lv_count = self._safe_int(fields[5])
                         uuid = fields[6].strip() if len(fields) > 6 else None
                         extent_size = fields[7].strip() if len(fields) > 7 else None
+                        lock_type = fields[8].strip() if len(fields) > 8 else None
+                        lock_args = fields[9].strip() if len(fields) > 9 else None
                         
                         free_percent = 0.0
                         if size_gb > 0:
@@ -341,7 +527,9 @@ class LVMStateChecker:
                             lv_count=lv_count,
                             attributes=attributes,
                             uuid=uuid,
-                            extent_size=extent_size
+                            extent_size=extent_size,
+                            lock_type=lock_type,
+                            lock_args=lock_args
                         )
                         vgs.append(vg)
                     except Exception as e:
@@ -352,7 +540,7 @@ class LVMStateChecker:
     
     def check_logical_volumes(self) -> List[LogicalVolume]:
         cmd = ["lvs", "--units", "g", "--nosuffix", "--noheadings",
-               "--separator", "|", "-o", "lv_name,vg_name,lv_size,lv_attr,pool_lv,origin,lv_uuid,segments"]
+               "--separator", "|", "-o", "lv_name,vg_name,lv_size,lv_attr,pool_lv,origin,lv_uuid,segments,raid_sync_percent,cache_total_blocks,cache_used_blocks"]
         
         output, code = self._run_command(cmd)
         lvs = []
@@ -365,14 +553,17 @@ class LVMStateChecker:
                 fields = line.strip().split('|')
                 if len(fields) >= 4:
                     try:
-                        name = fields[0].strip()
-                        vg_name = fields[1].strip()
+                        name = self._sanitize_lvm_name(fields[0].strip())
+                        vg_name = self._sanitize_lvm_name(fields[1].strip())
                         size_gb = self._safe_float(fields[2])
                         attributes = fields[3].strip()
                         pool = fields[4].strip() if len(fields) > 4 and fields[4].strip() else None
                         origin = fields[5].strip() if len(fields) > 5 and fields[5].strip() else None
                         uuid = fields[6].strip() if len(fields) > 6 else None
                         segments = fields[7].strip() if len(fields) > 7 else None
+                        raid_sync = self._safe_float(fields[8]) if len(fields) > 8 else None
+                        cache_total = self._safe_int(fields[9]) if len(fields) > 9 else None
+                        cache_used = self._safe_int(fields[10]) if len(fields) > 10 else None
                         
                         lv_type = "NORMAL"
                         if "t" in attributes:
@@ -385,7 +576,7 @@ class LVMStateChecker:
                             lv_type = "MIRRORED"
                         elif "r" in attributes:
                             lv_type = "RAID"
-                        elif "c" in attributes:
+                        elif "c" in attributes or "C" in attributes:
                             lv_type = "CACHE"
                         
                         status = "ACTIVE" if "a" in attributes else "INACTIVE"
@@ -402,7 +593,10 @@ class LVMStateChecker:
                             status=status,
                             attributes=attributes,
                             uuid=uuid,
-                            segments=segments
+                            segments=segments,
+                            raid_sync_percent=raid_sync,
+                            cache_total_blocks=cache_total,
+                            cache_used_blocks=cache_used
                         )
                         lvs.append(lv)
                     except Exception as e:
@@ -413,7 +607,8 @@ class LVMStateChecker:
     
     def check_thin_pools(self) -> List[ThinPool]:
         cmd = ["lvs", "--units", "g", "--nosuffix", "--noheadings",
-               "--separator", "|", "-o", "lv_name,vg_name,data_percent,metadata_percent,thin_count,lv_uuid"]
+               "--separator", "|", "-o", "lv_name,vg_name,data_percent,metadata_percent,thin_count,lv_uuid",
+               "--select", "lv_attr=~[^t.*]"]
         
         output, code = self._run_command(cmd)
         pools = []
@@ -424,10 +619,10 @@ class LVMStateChecker:
                     continue
                 
                 fields = line.strip().split('|')
-                if len(fields) >= 5 and "t" in line:
+                if len(fields) >= 5:
                     try:
-                        name = fields[0].strip()
-                        vg_name = fields[1].strip()
+                        name = self._sanitize_lvm_name(fields[0].strip())
+                        vg_name = self._sanitize_lvm_name(fields[1].strip())
                         data_percent = self._safe_float(fields[2])
                         metadata_percent = self._safe_float(fields[3])
                         thin_count = self._safe_int(fields[4])
@@ -448,18 +643,56 @@ class LVMStateChecker:
         
         return pools
     
+    def check_cache_pools(self) -> List[CachePool]:
+        cmd = ["lvs", "--units", "g", "--nosuffix", "--noheadings",
+               "--separator", "|", "-o", "lv_name,vg_name,cache_total_blocks,cache_used_blocks,cache_dirty_blocks,lv_uuid",
+               "--select", "lv_attr=~[^C.*]"]
+        
+        output, code = self._run_command(cmd)
+        pools = []
+        
+        if code == 0 and output:
+            for line in output.strip().split('\n'):
+                if not line.strip():
+                    continue
+                
+                fields = line.strip().split('|')
+                if len(fields) >= 4:
+                    try:
+                        name = self._sanitize_lvm_name(fields[0].strip())
+                        vg_name = self._sanitize_lvm_name(fields[1].strip())
+                        cache_total = self._safe_int(fields[2])
+                        cache_used = self._safe_int(fields[3])
+                        cache_dirty = self._safe_int(fields[4]) if len(fields) > 4 else None
+                        uuid = fields[5].strip() if len(fields) > 5 else None
+                        
+                        pool = CachePool(
+                            name=name,
+                            vg_name=vg_name,
+                            cache_total_blocks=cache_total,
+                            cache_used_blocks=cache_used,
+                            cache_dirty_blocks=cache_dirty,
+                            lv_uuid=uuid
+                        )
+                        pools.append(pool)
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"Error parsing cache pool line '{line}': {e}")
+        
+        return pools
+    
     def check_lvm_mounts(self) -> List[Dict[str, str]]:
         cmd = ["mount"]
         output, code = self._run_command(cmd)
         mounts = []
         
         if code == 0 and output:
-            pattern = re.compile(r'^(/dev/(mapper|dm-\d+)[^\s]+)\s+on\s+([^\s]+)\s+type\s+([^\s]+)')
+            pattern = re.compile(r'^(/dev/(?:mapper|dm-\d+)[^ ]+) on ([^ ]+) type ([^ ]+)')
             
             for line in output.strip().split('\n'):
                 match = pattern.search(line)
                 if match:
-                    device, mount_point, fs_type = match.group(1), match.group(3), match.group(4)
+                    device, mount_point, fs_type = match.group(1), match.group(2), match.group(3)
                     mounts.append({
                         'device': device,
                         'mount_point': mount_point,
@@ -469,6 +702,9 @@ class LVMStateChecker:
         return mounts
     
     def check_dm_devices(self) -> List[Dict[str, str]]:
+        if not self._is_root:
+            return []
+        
         cmd = ["dmsetup", "status"]
         output, code = self._run_command(cmd)
         devices = []
@@ -534,6 +770,82 @@ class LVMStateChecker:
         
         return result
     
+    def check_lvm_config(self) -> Dict[str, Any]:
+        config_files = [
+            ('/etc/lvm/lvm.conf', 'main_config'),
+            ('/etc/lvm/lvmlocal.conf', 'local_config')
+        ]
+        
+        result = {
+            'files': [],
+            'valid': True
+        }
+        
+        for config_path, config_name in config_files:
+            file_info = {
+                'path': config_path,
+                'name': config_name,
+                'exists': False,
+                'accessible': False,
+                'lines': 0
+            }
+            
+            try:
+                path = pathlib.Path(config_path)
+                if path.exists() and path.is_file():
+                    file_info['exists'] = True
+                    
+                    try:
+                        with open(config_path, 'r') as f:
+                            lines = f.readlines()
+                            file_info['lines'] = len(lines)
+                            file_info['accessible'] = True
+                            
+                            for line in lines:
+                                if line.strip().startswith('filter') or line.strip().startswith('global_filter'):
+                                    result['filters'] = result.get('filters', [])
+                                    result['filters'].append(line.strip())
+                    except PermissionError:
+                        file_info['accessible'] = False
+                        result['valid'] = False
+            except Exception:
+                pass
+            
+            result['files'].append(file_info)
+        
+        return result
+    
+    def check_system_memory(self) -> Dict[str, Any]:
+        result = {
+            'total_gb': 0,
+            'available_gb': 0,
+            'free_gb': 0,
+            'sufficient_for_thin': True
+        }
+        
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                meminfo = {}
+                for line in f:
+                    if ':' in line:
+                        key, value = line.split(':', 1)
+                        meminfo[key.strip()] = value.strip()
+            
+            total_kb = self._safe_int(meminfo.get('MemTotal', '').replace('kB', '').strip(), 0)
+            available_kb = self._safe_int(meminfo.get('MemAvailable', '').replace('kB', '').strip(), 0)
+            free_kb = self._safe_int(meminfo.get('MemFree', '').replace('kB', '').strip(), 0)
+            
+            result['total_gb'] = total_kb / 1024 / 1024
+            result['available_gb'] = available_kb / 1024 / 1024
+            result['free_gb'] = free_kb / 1024 / 1024
+            
+            result['sufficient_for_thin'] = available_kb > 256 * 1024
+            
+        except Exception:
+            pass
+        
+        return result
+    
     def _display_table(self, title: str, headers: List[str], data: List[List[str]]) -> None:
         print(f"\n{self._colorize('=' * 80, Color.BOLD)}")
         print(f"{self._colorize(title.center(80), Color.BOLD)}")
@@ -566,6 +878,7 @@ class LVMStateChecker:
         data = []
         for pv in pvs:
             status_display = self._format_status(pv.lvm_status)
+            errors = str(pv.disk_errors) if pv.disk_errors else "0"
             data.append([
                 pv.name,
                 pv.vg_name,
@@ -573,12 +886,13 @@ class LVMStateChecker:
                 self._human_size(pv.free_gb),
                 f"{pv.used_percent:.1f}%",
                 pv.status,
+                errors,
                 status_display
             ])
         
         self._display_table(
             "PHYSICAL VOLUMES",
-            ["PV Name", "VG Name", "Size", "Free", "Used %", "Status", "Health"],
+            ["PV Name", "VG Name", "Size", "Free", "Used %", "Status", "Disk Errors", "Health"],
             data
         )
     
@@ -590,6 +904,12 @@ class LVMStateChecker:
         data = []
         for vg in vgs:
             status_display = self._format_status(vg.lvm_status)
+            lock_info = vg.lock_type or "none"
+            if lock_info == "none":
+                lock_info = self._colorize("none", Color.GREEN)
+            else:
+                lock_info = self._colorize(lock_info, Color.YELLOW)
+            
             data.append([
                 vg.name,
                 self._human_size(vg.size_gb),
@@ -597,12 +917,13 @@ class LVMStateChecker:
                 f"{vg.free_percent:.1f}%",
                 str(vg.pv_count),
                 str(vg.lv_count),
+                lock_info,
                 status_display
             ])
         
         self._display_table(
             "VOLUME GROUPS",
-            ["VG Name", "Size", "Free", "Free %", "PVs", "LVs", "Health"],
+            ["VG Name", "Size", "Free", "Free %", "PVs", "LVs", "Lock", "Health"],
             data
         )
     
@@ -614,6 +935,14 @@ class LVMStateChecker:
         data = []
         for lv in lvs:
             status_display = self._format_status(lv.lvm_status)
+            sync_info = f"{lv.raid_sync_percent:.1f}%" if lv.raid_sync_percent is not None else "-"
+            
+            if lv.cache_total_blocks and lv.cache_used_blocks:
+                cache_percent = (lv.cache_used_blocks / lv.cache_total_blocks * 100) if lv.cache_total_blocks > 0 else 0
+                cache_info = f"{cache_percent:.1f}%"
+            else:
+                cache_info = "-"
+            
             data.append([
                 lv.vg_name,
                 lv.name,
@@ -621,12 +950,14 @@ class LVMStateChecker:
                 lv.lv_type,
                 lv.pool or "-",
                 lv.origin or "-",
+                sync_info,
+                cache_info,
                 status_display
             ])
         
         self._display_table(
             "LOGICAL VOLUMES",
-            ["VG Name", "LV Name", "Size", "Type", "Pool", "Origin", "Health"],
+            ["VG Name", "LV Name", "Size", "Type", "Pool", "Origin", "RAID Sync", "Cache %", "Health"],
             data
         )
     
@@ -650,6 +981,32 @@ class LVMStateChecker:
         self._display_table(
             "THIN POOLS",
             ["VG Name", "Pool Name", "Data Used %", "Meta Used %", "Thin Volumes", "Health"],
+            data
+        )
+    
+    def display_cache_pools(self, pools: List[CachePool]) -> None:
+        if not pools:
+            return
+        
+        data = []
+        for pool in pools:
+            status_display = self._format_status(pool.lvm_status)
+            usage = (pool.cache_used_blocks / pool.cache_total_blocks * 100) if pool.cache_total_blocks > 0 else 0
+            dirty = f"{pool.cache_dirty_blocks}" if pool.cache_dirty_blocks is not None else "-"
+            
+            data.append([
+                pool.vg_name,
+                pool.name,
+                str(pool.cache_total_blocks),
+                str(pool.cache_used_blocks),
+                f"{usage:.1f}%",
+                dirty,
+                status_display
+            ])
+        
+        self._display_table(
+            "CACHE POOLS",
+            ["VG Name", "Pool Name", "Total Blocks", "Used Blocks", "Usage %", "Dirty Blocks", "Health"],
             data
         )
     
@@ -714,7 +1071,36 @@ class LVMStateChecker:
         if backup_info['total_files'] > 0:
             print(f"\nTotal backup files: {backup_info['total_files']}")
     
-    def generate_health_report(self, pvs, vgs, lvs, thin_pools) -> Tuple[List[str], List[str]]:
+    def display_disk_health(self, disks: List[DiskInfo]) -> None:
+        if not disks:
+            return
+        
+        data = []
+        for disk in disks:
+            size_str = self._human_size(disk.size_gb) if disk.size_gb else "N/A"
+            error_str = f"{disk.read_errors}/{disk.write_errors}"
+            health = LVMStatus.HEALTHY
+            if disk.read_errors > 10 or disk.write_errors > 10:
+                health = LVMStatus.CRITICAL
+            elif disk.read_errors > 0 or disk.write_errors > 0:
+                health = LVMStatus.WARNING
+            
+            status_display = self._format_status(health)
+            data.append([
+                disk.name,
+                disk.model or "N/A",
+                size_str,
+                error_str,
+                status_display
+            ])
+        
+        self._display_table(
+            "DISK HEALTH",
+            ["Disk", "Model", "Size", "R/W Errors", "Health"],
+            data
+        )
+    
+    def generate_health_report(self, pvs, vgs, lvs, thin_pools, cache_pools, disks) -> Tuple[List[str], List[str]]:
         issues = []
         warnings = []
         
@@ -723,18 +1109,31 @@ class LVMStateChecker:
                 issues.append(f"Critical PV: {pv.name} ({pv.status})")
             elif pv.lvm_status == LVMStatus.WARNING:
                 warnings.append(f"Warning PV: {pv.name} ({pv.status})")
+            if pv.disk_errors and pv.disk_errors > 10:
+                issues.append(f"Critical Disk Errors: {pv.name} ({pv.disk_errors} errors)")
+            elif pv.disk_errors and pv.disk_errors > 0:
+                warnings.append(f"Disk Errors: {pv.name} ({pv.disk_errors} errors)")
         
         for vg in vgs:
             if vg.lvm_status == LVMStatus.CRITICAL:
-                issues.append(f"Critical VG: {vg.name} (partial/missing)")
-            elif vg.free_percent < 5:
-                issues.append(f"Critical VG: {vg.name} (only {vg.free_percent:.1f}% free)")
-            elif vg.free_percent < 10:
-                warnings.append(f"Warning VG: {vg.name} (low free space: {vg.free_percent:.1f}%)")
+                if "p" in vg.attributes or "x" in vg.attributes:
+                    issues.append(f"Critical VG: {vg.name} (partial/missing)")
+                elif vg.free_percent < 5:
+                    issues.append(f"Critical VG: {vg.name} (only {vg.free_percent:.1f}% free)")
+            elif vg.lvm_status == LVMStatus.WARNING:
+                if vg.free_percent < 10:
+                    warnings.append(f"Warning VG: {vg.name} (low free space: {vg.free_percent:.1f}%)")
+                if vg.lock_type and vg.lock_type not in ["normal", "None", ""]:
+                    warnings.append(f"Warning VG: {vg.name} (locked: {vg.lock_type})")
         
         for lv in lvs:
             if lv.lvm_status == LVMStatus.CRITICAL:
                 issues.append(f"Critical LV: {lv.vg_name}/{lv.name} (inactive)")
+            elif lv.lvm_status == LVMStatus.WARNING:
+                if "m" in lv.attributes:
+                    warnings.append(f"Warning LV: {lv.vg_name}/{lv.name} (mirrored issues)")
+                if "r" in lv.attributes and lv.raid_sync_percent is not None and lv.raid_sync_percent < 100:
+                    warnings.append(f"Warning LV: {lv.vg_name}/{lv.name} (RAID sync: {lv.raid_sync_percent:.1f}%)")
         
         for pool in thin_pools:
             if pool.lvm_status == LVMStatus.CRITICAL:
@@ -742,9 +1141,21 @@ class LVMStateChecker:
             elif pool.lvm_status == LVMStatus.WARNING:
                 warnings.append(f"Warning Thin Pool: {pool.vg_name}/{pool.name} ({pool.data_percent:.1f}% used)")
         
+        for pool in cache_pools:
+            if pool.lvm_status == LVMStatus.CRITICAL:
+                issues.append(f"Critical Cache Pool: {pool.vg_name}/{pool.name} (over 95% full)")
+            elif pool.lvm_status == LVMStatus.WARNING:
+                warnings.append(f"Warning Cache Pool: {pool.vg_name}/{pool.name} (over 85% full)")
+        
+        for disk in disks:
+            if disk.read_errors > 10 or disk.write_errors > 10:
+                issues.append(f"Critical Disk: {disk.name} ({disk.read_errors}/{disk.write_errors} R/W errors)")
+            elif disk.read_errors > 0 or disk.write_errors > 0:
+                warnings.append(f"Warning Disk: {disk.name} ({disk.read_errors}/{disk.write_errors} R/W errors)")
+        
         return issues, warnings
     
-    def display_summary(self, pvs, vgs, lvs, thin_pools, mounts, dm_devices, issues, warnings) -> None:
+    def display_summary(self, pvs, vgs, lvs, thin_pools, cache_pools, disks, mounts, dm_devices, issues, warnings) -> None:
         total_size_gb = sum(vg.size_gb for vg in vgs)
         total_free_gb = sum(vg.free_gb for vg in vgs)
         total_free_percent = (total_free_gb / total_size_gb * 100) if total_size_gb > 0 else 0
@@ -753,15 +1164,20 @@ class LVMStateChecker:
         healthy_vgs = sum(1 for vg in vgs if vg.lvm_status == LVMStatus.HEALTHY)
         healthy_lvs = sum(1 for lv in lvs if lv.lvm_status == LVMStatus.HEALTHY)
         
+        memory_info = self.check_system_memory()
+        
         data = [
             ["Physical Volumes", f"{healthy_pvs}/{len(pvs)} healthy"],
             ["Volume Groups", f"{healthy_vgs}/{len(vgs)} healthy"],
             ["Logical Volumes", f"{healthy_lvs}/{len(lvs)} healthy"],
             ["Thin Pools", str(len(thin_pools))],
+            ["Cache Pools", str(len(cache_pools))],
             ["Mounted Volumes", str(len(mounts))],
             ["DM Devices", str(len(dm_devices))],
             ["Total LVM Storage", self._human_size(total_size_gb)],
-            ["Total Free Space", f"{self._human_size(total_free_gb)} ({total_free_percent:.1f}%)"]
+            ["Total Free Space", f"{self._human_size(total_free_gb)} ({total_free_percent:.1f}%)"],
+            ["System Memory", f"{memory_info['available_gb']:.1f} GB available"],
+            ["Sufficient for thin", "YES" if memory_info['sufficient_for_thin'] else self._colorize("NO", Color.YELLOW)]
         ]
         
         overall_status = LVMStatus.HEALTHY
@@ -772,6 +1188,7 @@ class LVMStateChecker:
         
         print(f"\n{self._colorize('LVM SYSTEM SUMMARY', Color.BOLD)}")
         print(f"Overall Status: {self._format_status(overall_status)}")
+        print(f"Check Time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
         
         if not self._is_root:
             print(f"{self._colorize('Note: Not running as root - some information may be limited', Color.YELLOW)}")
@@ -787,10 +1204,24 @@ class LVMStateChecker:
             print(f"\n{self._colorize('Critical Issues:', Color.RED)}")
             for issue in issues:
                 print(f"  • {issue}")
+        
+        if issues:
+            print(f"\n{self._colorize('Recommended Actions:', Color.CYAN)}")
+            for issue in issues:
+                if "Critical VG" in issue and "only" in issue:
+                    print(f"  • Consider extending volume group or cleaning up unused LVs")
+                elif "Critical PV" in issue:
+                    print(f"  • Check physical disk health and connectivity")
+                elif "Critical Thin Pool" in issue:
+                    print(f"  • Extend thin pool or migrate data to free up space")
+                elif "Critical Disk Errors" in issue:
+                    print(f"  • Replace failing disk immediately")
     
     def run_full_check(self) -> LVMHealthCheck:
         print(f"{self._colorize('LVM SYSTEM HEALTH CHECK', Color.BOLD + Color.CYAN)}")
         print(f"{self._colorize('=' * 80, Color.BOLD)}\n")
+        
+        start_time = time.time()
         
         if not self._is_root:
             print(f"{self._colorize('Warning: Not running as root. Some information may be limited.', Color.YELLOW)}")
@@ -802,30 +1233,41 @@ class LVMStateChecker:
         
         print(f"{self._colorize('Collecting LVM information...', Color.BLUE)}")
         
+        disks = self.check_disk_health()
         pvs = self.check_physical_volumes()
         vgs = self.check_volume_groups()
         lvs = self.check_logical_volumes()
         thin_pools = self.check_thin_pools()
+        cache_pools = self.check_cache_pools()
         mounts = self.check_lvm_mounts()
         dm_devices = self.check_dm_devices()
         metadata_backup = self.check_lvm_metadata_backup()
         
-        issues, warnings = self.generate_health_report(pvs, vgs, lvs, thin_pools)
+        issues, warnings = self.generate_health_report(pvs, vgs, lvs, thin_pools, cache_pools, disks)
         
         self.display_physical_volumes(pvs)
         self.display_volume_groups(vgs)
         self.display_logical_volumes(lvs)
         self.display_thin_pools(thin_pools)
+        if cache_pools:
+            self.display_cache_pools(cache_pools)
+        self.display_disk_health(disks)
         self.display_mounts(mounts)
-        self.display_dm_devices(dm_devices)
+        if dm_devices:
+            self.display_dm_devices(dm_devices)
         self.display_metadata_backup(metadata_backup)
-        self.display_summary(pvs, vgs, lvs, thin_pools, mounts, dm_devices, issues, warnings)
+        self.display_summary(pvs, vgs, lvs, thin_pools, cache_pools, disks, mounts, dm_devices, issues, warnings)
+        
+        elapsed = time.time() - start_time
+        print(f"\n{self._colorize(f'Check completed in {elapsed:.2f} seconds', Color.BLUE)}")
         
         self.health_check = LVMHealthCheck(
             pvs=pvs,
             vgs=vgs,
             lvs=lvs,
             thin_pools=thin_pools,
+            cache_pools=cache_pools,
+            disks=disks,
             mounts=mounts,
             dm_devices=dm_devices,
             metadata_backup=metadata_backup,
@@ -841,6 +1283,16 @@ class LVMStateChecker:
             print(f"{self._colorize('Error: No health check data available', Color.RED)}")
             return False
         
+        class LVMEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, LVMStatus):
+                    return obj.value
+                if isinstance(obj, (PhysicalVolume, VolumeGroup, LogicalVolume, ThinPool, CachePool, DiskInfo)):
+                    return asdict(obj)
+                if hasattr(obj, '__dict__'):
+                    return obj.__dict__
+                return super().default(obj)
+        
         try:
             data = {
                 'timestamp': self.health_check.timestamp,
@@ -851,13 +1303,15 @@ class LVMStateChecker:
                 'volume_groups': [asdict(vg) for vg in self.health_check.vgs],
                 'logical_volumes': [asdict(lv) for lv in self.health_check.lvs],
                 'thin_pools': [asdict(pool) for pool in self.health_check.thin_pools],
+                'cache_pools': [asdict(pool) for pool in self.health_check.cache_pools],
+                'disks': [asdict(disk) for disk in self.health_check.disks],
                 'mounts': self.health_check.mounts,
                 'dm_devices': self.health_check.dm_devices,
                 'metadata_backup': self.health_check.metadata_backup
             }
             
             with open(filename, 'w') as f:
-                json.dump(data, f, indent=2, default=str)
+                json.dump(data, f, indent=2, cls=LVMEncoder)
             
             print(f"\n{self._colorize('✓', Color.GREEN)} Data exported to {filename}")
             return True
@@ -871,21 +1325,43 @@ class LVMStateChecker:
             return False
         
         try:
+            timestamp = int(time.time() * 1000)
+            metrics = []
+            
+            metrics.append(f"# HELP lvm_health_check LVM health check metrics")
+            metrics.append(f"# TYPE lvm_health_check gauge")
+            metrics.append(f'lvm_health_check{{type="overall"}} {1 if self.health_check.overall_status == LVMStatus.HEALTHY else 0} {timestamp}')
+            
+            metrics.append(f"\n# HELP lvm_volume_group_free_percent Volume group free space percentage")
+            metrics.append(f"# TYPE lvm_volume_group_free_percent gauge")
+            for vg in self.health_check.vgs:
+                metrics.append(f'lvm_volume_group_free_percent{{vg="{vg.name}"}} {vg.free_percent} {timestamp}')
+            
+            metrics.append(f"\n# HELP lvm_volume_group_size Volume group total size in GB")
+            metrics.append(f"# TYPE lvm_volume_group_size gauge")
+            for vg in self.health_check.vgs:
+                metrics.append(f'lvm_volume_group_size{{vg="{vg.name}"}} {vg.size_gb} {timestamp}')
+            
+            metrics.append(f"\n# HELP lvm_thin_pool_usage Thin pool usage percentage")
+            metrics.append(f"# TYPE lvm_thin_pool_usage gauge")
+            for pool in self.health_check.thin_pools:
+                metrics.append(f'lvm_thin_pool_usage{{pool="{pool.vg_name}/{pool.name}",type="data"}} {pool.data_percent} {timestamp}')
+                metrics.append(f'lvm_thin_pool_usage{{pool="{pool.vg_name}/{pool.name}",type="metadata"}} {pool.metadata_percent} {timestamp}')
+            
+            metrics.append(f"\n# HELP lvm_disk_errors Disk I/O errors")
+            metrics.append(f"# TYPE lvm_disk_errors counter")
+            for disk in self.health_check.disks:
+                metrics.append(f'lvm_disk_errors{{disk="{disk.name}",type="read"}} {disk.read_errors} {timestamp}')
+                metrics.append(f'lvm_disk_errors{{disk="{disk.name}",type="write"}} {disk.write_errors} {timestamp}')
+            
+            metrics.append(f"\n# HELP lvm_cache_pool_usage Cache pool usage percentage")
+            metrics.append(f"# TYPE lvm_cache_pool_usage gauge")
+            for pool in self.health_check.cache_pools:
+                usage = (pool.cache_used_blocks / pool.cache_total_blocks * 100) if pool.cache_total_blocks > 0 else 0
+                metrics.append(f'lvm_cache_pool_usage{{pool="{pool.vg_name}/{pool.name}"}} {usage} {timestamp}')
+            
             with open(filename, 'w') as f:
-                f.write(f"# HELP lvm_health_check LVM health check metrics\n")
-                f.write(f"# TYPE lvm_health_check gauge\n")
-                f.write(f"lvm_health_check{{type=\"overall\"}} {1 if self.health_check.overall_status == LVMStatus.HEALTHY else 0}\n")
-                
-                f.write(f"\n# HELP lvm_volume_group_free_percent Volume group free space percentage\n")
-                f.write(f"# TYPE lvm_volume_group_free_percent gauge\n")
-                for vg in self.health_check.vgs:
-                    f.write(f'lvm_volume_group_free_percent{{vg="{vg.name}"}} {vg.free_percent}\n')
-                
-                f.write(f"\n# HELP lvm_thin_pool_usage Thin pool usage percentage\n")
-                f.write(f"# TYPE lvm_thin_pool_usage gauge\n")
-                for pool in self.health_check.thin_pools:
-                    f.write(f'lvm_thin_pool_usage{{pool="{pool.vg_name}/{pool.name}",type="data"}} {pool.data_percent}\n')
-                    f.write(f'lvm_thin_pool_usage{{pool="{pool.vg_name}/{pool.name}",type="metadata"}} {pool.metadata_percent}\n')
+                f.write("\n".join(metrics))
             
             print(f"\n{self._colorize('✓', Color.GREEN)} Prometheus metrics exported to {filename}")
             return True
@@ -917,6 +1393,8 @@ def main():
                        help='Disable colored output')
     parser.add_argument('--timeout', type=int, default=30,
                        help='Command timeout in seconds')
+    parser.add_argument('--cache-ttl', type=int, default=300,
+                       help='Cache TTL in seconds')
     
     args = parser.parse_args()
     
@@ -926,6 +1404,7 @@ def main():
             color=not args.no_color,
             timeout=args.timeout
         )
+        checker._cache_ttl = args.cache_ttl
         
         health_check = checker.run_full_check()
         
